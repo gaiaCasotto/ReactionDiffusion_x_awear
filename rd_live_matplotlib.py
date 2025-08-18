@@ -51,12 +51,21 @@ def init_state(n, seed_size=20, seed_V=0.25, rng=None):
     U = np.ones((n,n), dtype=np.float32) #start with U everywhere
     V = np.zeros((n,n), dtype=np.float32) # no V
     #then add a seed of V in the middle
-    U += (rng.random((n,n), dtype=np.float32)-0.5)*0.02
-    V += (rng.random((n,n), dtype=np.float32)-0.5)*0.02
+    U += (rng.random((n,n), dtype=np.float32)-0.5)*0.05 #use 0.05 for agitated, 0.02 for calm
+    V += (rng.random((n,n), dtype=np.float32)-0.5)*0.05
     np.clip(U,0,1,out=U); np.clip(V,0,1,out=V)
+    #NORMAL SETUP:
+    '''
     c = n//2; s = seed_size
     V[c-s:c+s, c-s:c+s] = seed_V
     U[c-s:c+s, c-s:c+s] = 1.0 - seed_V
+    '''
+    #FOR CALM: make tiny seed
+    c , s = n//2 , n//16
+    V[c-s:c+s, c-s:c+s] = 0.20
+    U[c-s:c+s, c-s:c+s] = 0.80
+    #FOR AGITATED: start from a noisier initial state
+
     return U, V
 
 def main():
@@ -70,9 +79,25 @@ def main():
     U, V = init_state(n)
 
     # Parameters (start in a nice patterning regime)
+    '''
     Du, Dv = 0.16, 0.08
     F, k   = 0.037, 0.06
     dt     = 1.0
+    '''
+
+    #calm DEFAULTS
+    
+    Du, Dv = 0.18, 0.09
+    F, k   = 0.024, 0.060
+    dt     = 0.8
+    
+
+    #Stressed, agitated DEFAULTS 
+    #(+ speed up evolution in main looop)
+    #(+ add some jitter top each frame to keep it nervous)
+    Du, Dv = 0.15, 0.075
+    F,  k  = 0.046, 0.060
+    dt     = 1.1
 
     paused = False
     brush_radius = args.brush
@@ -163,8 +188,13 @@ def main():
                 if mouse_down:
                     paint_v(V, mouse_pos, brush_radius)
                 # Do several solver steps per frame for faster evolution
-                for _ in range(2):
+                for _ in range(3): # (1 or 2 for calm) , (3 (4?) for agitated)
                     U, V = step(U, V, Du, Dv, F, k, dt)
+                    #------- REMOVE FOR CALM ------- #
+                    noise_amp = 0.002
+                    U += (np.random.random(U.shape).astype(np.float32) - 0.5) * noise_amp
+                    V += (np.random.random(V.shape).astype(np.float32) - 0.5) * noise_amp
+                    np.clip(U, 0, 1, out=U); np.clip(V, 0, 1, out=V)
 
                 im.set_data(V)
                 im.figure.canvas.draw_idle()
