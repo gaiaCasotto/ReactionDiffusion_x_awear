@@ -1,0 +1,4 @@
+exec line :
+
+python rd_agitated_vs_calm.py --n 256 --fps 45 --micro_jitter 0.002
+
