@@ -1,0 +1,18 @@
+CALM COMBOS
+"long slow snakes"
+k = 0.063
+f = 0.069
+raise Da --> makes snakes faster and more squiggly
+lower Da --> makes snakes slower and thinner thinner until they disappear
+
+
+STRESSED
+"vibrating dots"
+k = 0.058
+f = 0.025
+lower Da --> more stressed ~ 1.050 
+equilibrium --> Da = 1.312
+
+Da < 0.8 equilibrium-ish but not in longer time spans
+
+

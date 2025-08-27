@@ -1,0 +1,165 @@
+import taichi as ti
+from sys import argv
+from random import randint
+
+programs = [["Unstable mitosis and cell death", 0.057, 0.013,  1.57,  0.509],
+    ["Holes emerging and disappearing",  0.055, 0.030, 1.08, 0.952],
+    ["Growing disk", 0.056, 0.04, 1.05, 1.050],
+    ["Flower folding", 0.056, 0.107, 1.50, 0.591],
+    ["Tight Pattern", 0.056, 0.107, 1.90, 0.28],
+    ["Dimples", 0.056, 0.1, 0.65, 0.215],
+    ["Pattern of dots and lines", 0.066, 0.1, 0.65, 0.215],
+    ["Colonies", 0.07, 0.011, 1.98, 0.231],
+    ["Seekers", 0.064, 0.060, 1.691, 0.855],
+    ["Colonisers", 0.064, 0.060, 1.691, 0.833]]
+
+
+@ti.func
+def smoothstep(x, edge0, edge1):
+    '''Smoothstep function'''
+    t = (x - edge0) / (edge1 - edge0)
+    t = max(0, min(1, t))  # Clamp t to [0, 1]
+    return t * t * (3 - 2 * t)
+
+
+ti.init(arch=ti.gpu)
+
+# Parameters for the Gray-Scott model
+# Mitosis
+dt = 0.5
+Da = ti.field(dtype=float, shape=())
+Db = ti.field(dtype=float, shape=())
+k = ti.field(dtype=float, shape=())
+f = ti.field(dtype=float, shape=())
+steps = ti.field(dtype=int, shape=())
+Da[None] = 1.0
+Db[None] = 0.5
+k[None] = 0.063
+f[None] = 0.069
+steps[None] = 100
+# k=.06088   
+# f=.05097
+# k=.05519   
+# f=.01569
+
+#Stressed!!
+# Targets the sim will ease TOWARD
+f_target  = ti.field(dtype=float, shape=())
+k_target  = ti.field(dtype=float, shape=())
+Da_target = ti.field(dtype=float, shape=())
+Db_target = ti.field(dtype=float, shape=())
+
+
+# Smoothed stress mix (0..1) for visuals: 0 = NOT STRESSED, 1 = STRESSED
+stress_mix = ti.field(dtype=float, shape=())  # replaces hard 0/1 flips if you like
+stress_mix[None] = 0.0
+
+
+# Operating parameters
+n = 800
+
+# Define the fields
+pixelsA = ti.field(dtype=float, shape=(n, n))
+pixelsB = ti.field(dtype=float, shape=(n, n))
+dA = ti.field(dtype=float, shape=(n, n))
+dB = ti.field(dtype=float, shape=(n, n))
+shading = ti.field(dtype=float, shape=(n, n))
+
+@ti.func
+def laplacian(i,j, pixels):
+    '''Implement the Laplacian operator'''
+    return 0.25*(pixels[i+1,j] + pixels[i-1,j] + pixels[i,j+1] + pixels[i,j-1] - 4 * pixels[i,j])
+
+@ti.kernel
+def initialize():
+    '''Initialize the fields'''
+    for i, j in ti.ndrange(n,n):  # Iterate over the first two dimensions
+        pixelsA[i, j] = 0.0
+        pixelsB[i, j] = 0.0
+    for _i, _j in ti.ndrange(n-2, n-2):  # Iterate over the first two dimensions
+        i, j = (_i+1, _j+1)  # Offset by 1 to avoid boundary issues
+        pixelsA[i, j] = 1.0
+    for _i, _j in ti.ndrange(20, 20):
+        i, j = (_i-10, _j-10)
+        pixelsB[n//2+i, n//2+j] = ti.exp(-0.1*(i**2+j**2))
+
+
+@ti.kernel
+def simulate():
+    '''Simulate the reaction-diffusion process'''
+    for _i, _j in ti.ndrange(n-2, n-2):  # Iterate over the first two dimensions
+        i, j = (_i+1, _j+1)  # Offset by 1 to avoid boundary issues
+        # Implement the Gray-Scott model (Karl Sim's version)
+        LapA = laplacian(i, j, pixelsA)
+        LapB = laplacian(i, j, pixelsB)
+        A = pixelsA[i, j]
+        B = pixelsB[i, j]
+        dA[i,j] = Da[None] * LapA - A * B**2 + f[None] * (1 - A)
+        dB[i,j] = Db[None] * LapB + A * B**2 - (k[None] + f[None])*B
+    for _i, _j in ti.ndrange(n-2, n-2):  # Iterate over the first two dimensions
+        i, j = (_i+1, _j+1)  # Offset by 1 to avoid boundary issues
+        pixelsA[i, j] += dA[i,j] * dt
+        pixelsB[i, j] += dB[i,j] * dt
+
+
+render_image = ti.Vector.field(3, dtype=ti.f32, shape=(n, n))
+
+@ti.kernel
+def render_with_shader_kernel(field: ti.template()):
+    '''Render the field with shading'''
+    for i, j in render_image:
+        t = field[i, j]
+        gx = field[min(i + 1, n - 1), j] - field[max(i - 1, 0), j]
+        gy = field[i, min(j + 1, n - 1)] - field[i, max(j - 1, 0)]
+        norm = ti.Vector([-gx, -gy, 1.0]).normalized()
+        light_dir = ti.Vector([0.5, 1.0, 12.0]).normalized()
+        illum = max(0, light_dir.dot(norm))
+        spec_illum = smoothstep(illum, 0.99, 0.999)
+        white = ti.Vector([1.0, 1.0, 1.0])
+        col = ti.Vector([0.4-t, 0.4-t, t])
+        render_image[i, j] = illum*col + spec_illum*white*0.5
+
+def main():
+    window = ti.ui.Window("Reaction Diffusion", (n, n))
+    canvas = window.get_canvas()
+
+    on_program = False
+
+    if len(argv) > 1: #if argument is passed on command line
+        on_program = True
+        i = int(argv[1])
+        k[None] = programs[i][1]
+        f[None] = programs[i][2]
+        Da[None] = programs[i][3]
+        Db[None] = programs[i][4]
+    else:
+        gui = window.get_gui()
+
+    initialize()
+    outer_steps = 0
+    while window.running:
+        outer_steps += 1
+        # Update k and f from sliders
+        if not on_program:
+            gui.begin("Controls",0,0,0.25,0.18)
+            k[None] = gui.slider_float("k", k[None], 0.014, 0.07)
+            f[None] = gui.slider_float("f", f[None], 0.002, 0.12)
+            Da[None] = gui.slider_float("Da", Da[None], 0.1, 2.0)
+            Db[None] = gui.slider_float("Db", Db[None], 0.1, 2.0)
+            steps[None] = gui.slider_int("Steps", steps[None], 1, 300)
+            button = gui.button("Reset")
+            if button:
+                initialize()
+            gui.end()
+
+
+        for _ in range(steps[None]):
+            simulate()
+        render_with_shader_kernel(pixelsB)
+
+        # Render the image
+        canvas.set_image(render_image)
+        window.show()
+
+if __name__ == "__main__":
+    main()

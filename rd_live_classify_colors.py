@@ -7,7 +7,7 @@ Controls:
   • SPACE = Pause/Resume,  R = Reset,  S = Save PNG,  Q/ESC = Quit.
 
 Requirements: numpy, matplotlib
-Run: python rd_live_matplotlib.py --n 256
+Run: python rd_live_classify_colors.py --n 256 
 """
 
 """
@@ -204,13 +204,26 @@ def main():
                 continue
             last = now
 
+            '''
             # Update params from sliders
             F  = float(s_F.val);  k  = float(s_k.val)
             Du = float(s_Du.val); Dv = float(s_Dv.val)
             dt = float(s_dt.val)
-
+            '''
             feeder.step_once()
             state, ratio, changed = clf.update(feeder.get_buffer())
+
+            # choose RD params based on stress state
+            if state == "STRESSED":
+                F, k, Du, Dv = 0.052, 0.055, 0.14, 0.07
+            else:  # NOT STRESSED
+                F, k, Du, Dv = 0.024, 0.060, 0.18, 0.09
+
+            s_F.set_val(F)
+            s_k.set_val(k)
+            s_Du.set_val(Du)
+            s_Dv.set_val(Dv)
+
 
 
             if not paused:
