@@ -1,3 +1,34 @@
+"""
+---- NOTES ON EEG ----- # to add on overleaf
+
+
+EEG frequency bands
+Delta: 0.5 – 4 Hz → deep sleep, very low arousal
+Theta: 4 – 8 Hz → drowsiness, light sleep, relaxed attention
+Alpha: 8 – 12 Hz → relaxed wakefulness, calm but alert
+Beta: 13 – 30 Hz → active thinking, alertness, stress, anxiety
+Gamma: > 30 Hz → high-level processing, hyperarousal, sometimes linked to stress
+
+
+Mapping to LF and HF (common in stress research)
+LF (Low Frequency)
+    Delta + Theta (0.5 – 8 Hz)
+    Sometimes includes Alpha (depending on the study)
+    Interpreted as relaxation / baseline cognitive state
+HF (High Frequency)
+    Beta + Gamma (13 – 40+ Hz)
+    Interpreted as arousal, stress, cognitive load
+
+
+    
+If HF power ↑ relative to LF → brain is in a high-arousal / stressed / anxious state
+If LF power dominates → calmer, more relaxed baseline
+
+"""
+
+
+
+
 # offline_eeg_stream.py
 import time
 from collections import deque
@@ -66,6 +97,13 @@ class LiveArousalClassifier:
         self.win_s = float(win_s)
         self.state="NOT STRESSED"
         self.last_ratio=np.nan
+    
+    '''
+    keep in mind:
+    1) Ratios are unitless and scale-sensitive: If LF power is very small (close to 0), 
+    the ratio can blow up because of division.
+    That’s why i add 1e-12 in your code — to avoid divide-by-zero.
+    '''
     def update(self, buffer):
         freqs, psd = compute_psd(buffer, self.fs, self.win_s)
         lf_p = bandpower(psd, freqs, *self.lf)

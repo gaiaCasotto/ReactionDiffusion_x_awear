@@ -7,6 +7,7 @@ from collections import deque
 import numpy as np
 import taichi as ti
 
+#my own file - reads brainwave files and classifies stressed or not
 from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
 
 # =========================
