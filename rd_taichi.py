@@ -32,10 +32,10 @@ Db = ti.field(dtype=float, shape=())
 k = ti.field(dtype=float, shape=())
 f = ti.field(dtype=float, shape=())
 steps = ti.field(dtype=int, shape=())
-Da[None] = 1.0
+Da[None] = 0.755
 Db[None] = 0.5
-k[None] = 0.063
-f[None] = 0.069
+k[None] = 0.060
+f[None] = 0.053
 steps[None] = 100
 # k=.06088   
 # f=.05097

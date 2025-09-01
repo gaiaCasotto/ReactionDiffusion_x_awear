@@ -6,43 +6,17 @@ from sys import argv
 from collections import deque
 import numpy as np
 import taichi as ti
-
-#my own file - reads brainwave files and classifies stressed or not
+# (my own file - reads brainwave files and classifies stressed or not)
 from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
 
 # =========================
 # Taichi Reaction–Diffusion
 # =========================
-programs = [["Unstable mitosis and cell death", 0.057, 0.013,  1.57,  0.509],
-    ["Holes emerging and disappearing",  0.055, 0.030, 1.08, 0.952],
-    ["Growing disk", 0.056, 0.04, 1.05, 1.050],
-    ["Flower folding", 0.056, 0.107, 1.50, 0.591],
-    ["Tight Pattern", 0.056, 0.107, 1.90, 0.28],
-    ["Dimples", 0.056, 0.1, 0.65, 0.215],
-    ["Pattern of dots and lines", 0.066, 0.1, 0.65, 0.215],
-    ["Colonies", 0.07, 0.011, 1.98, 0.231],
-    ["Seekers", 0.064, 0.060, 1.691, 0.855],
-    ["Colonisers", 0.064, 0.060, 1.691, 0.833]]
 
-# --- put near your other Python globals ---
-import time, numpy as np
-t0 = time.perf_counter()
+#==========================
+#   GLOBAL VARIABLES 
+#==========================
 
-# tiny wobble amplitudes (tune to taste)
-AMP_F, AMP_K  = 0.0010, 0.001
-AMP_DA, AMP_DB = 0.015, 0.010
-# slow frequencies in Hz (different so they don’t sync)
-FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
-
-# helper to clamp
-def clamp(x, lo, hi): return max(lo, min(hi, x))
-
-
-@ti.func
-def smoothstep(x, edge0, edge1):
-    t = (x - edge0) / (edge1 - edge0)
-    t = max(0, min(1, t))  # Clamp t to [0, 1]
-    return t * t * (3 - 2 * t)
 
 ti.init(arch=ti.gpu)
 
@@ -60,7 +34,6 @@ k[None] = 0.063;
 f[None] = 0.069;  
 steps[None] = 100
 #stressed = 0.025, 0.058, 1.050, 0.50
-
 
 # Targets the sim will ease TOWARD
 f_target  = ti.field(dtype=float, shape=())
@@ -82,8 +55,33 @@ pixelsB = ti.field(dtype=float, shape=(n, n))
 dA = ti.field(dtype=float, shape=(n, n))
 dB = ti.field(dtype=float, shape=(n, n))
 shading = ti.field(dtype=float, shape=(n, n))
-#render_image = ti.Vector.field(3, dtype=ti.f32, shape=(n, n))
-stress_state = ti.field(dtype=ti.i32, shape=())  # 1=STRESSED, 0=NOT
+stress_state = ti.field(dtype=ti.i32, shape=()) 
+
+'''
+^^^
+# Stress levels encoded as integers
+# 0 = CALM / RELAXED
+# 1 = MODERATE STRESS
+# 2 = HIGH STRESS
+# 3 = EXTREME STRESS
+
+'''
+
+# tiny wobble amplitudes
+AMP_F, AMP_K  = 0.0010, 0.001
+AMP_DA, AMP_DB = 0.015, 0.010
+# slow frequencies in Hz (different so they don’t sync)
+FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
+
+
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+
+@ti.func
+def smoothstep(x, edge0, edge1):
+    t = (x - edge0) / (edge1 - edge0)
+    t = max(0, min(1, t))  # Clamp t to [0, 1]
+    return t * t * (3 - 2 * t)
 
 @ti.func
 def laplacian(i,j, pixels):
@@ -105,7 +103,7 @@ def initialize():
 def simulate():
     for _i, _j in ti.ndrange(n-2, n-2):
         i, j = (_i+1, _j+1)
-        # Implement the Gray-Scott model (Karl Sim's version)
+        # Gray-Scott model (Karl Sim's version)
         LapA = laplacian(i, j, pixelsA)
         LapB = laplacian(i, j, pixelsB)
         A = pixelsA[i, j]
@@ -123,7 +121,6 @@ render_image = ti.Vector.field(3, dtype=ti.f32, shape=(n, n))
 
 @ti.kernel
 def render_with_shader_kernel(field: ti.template()):
-    # Hot/high-contrast when stressed; cool/softer when not
     for i, j in render_image:
         t = field[i, j]
         gx = field[min(i + 1, n - 1), j] - field[max(i - 1, 0), j]
@@ -135,22 +132,9 @@ def render_with_shader_kernel(field: ti.template()):
         white = ti.Vector([1.0, 1.0, 1.0])
         col = ti.Vector([0.4-t, 0.4-t, t])
         render_image[i, j] = illum*col + spec_illum*white*0.5
-        '''if stress_state[None] == 1:
-            # STRESSED: hotter palette, higher contrast
-            base = ti.Vector([t, 0.18, 0.02])  # hot
-            col = illum * base * 1.15 + spec_illum * white * 0.7
-        else:
-            # NOT STRESSED: cooler palette, softer contrast
-            base = ti.Vector([0.20 - 0.10*t, 0.40 - 0.15*t, t])  # cool
-            col = illum * base * 0.95 + spec_illum * white * 0.4
-
-        # Clamp
-        col = ti.max(ti.min(col, 1.0), 0.0)
-        render_image[i, j] = col
-        '''
 
         
-#easing kernel. We’ll use an exponential approach with time-constant tau
+#easing kernel. exponential approach with time-constant tau
 @ti.kernel
 def ease_params(alpha: float):
     # Exponential smoothing: x += alpha * (target - x)
@@ -163,22 +147,21 @@ def ease_params(alpha: float):
 def ease_stress(alpha: float, target: float):
     stress_mix[None] += alpha * (target - stress_mix[None])
     
-
+t0 = time.perf_counter()
 
 def main():
     # ---------- EEG setup ----------
     EEG_FILES = [
         #"../eeg_files/1_horror_movie_data_filtered.txt",
-        "../eeg_files/2_vipassana_data_filtered.txt",
+        #"../eeg_files/2_vipassana_data_filtered.txt",
         #"../eeg_files/3_hot_tub_data_filtered.txt",
-        #"../eeg_files/fake_eeg_stress2calm.txt"
         #"../eeg_files/fake_eeg_longblocks.txt" #stressed first
-        #"../eeg_files/fake_eeg_longblocks_calmfirst.txt"
+        "../eeg_files/fake_eeg_longblocks_calmfirst.txt"
     ]
     EEG_FS = 256.0
     try:
         feeder = OfflineEEGFeeder(EEG_FILES, fs=EEG_FS, chunk=32, speed=1.0, loop=True, buffer_s=8.0)
-        clf = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), thr=3.0, hyst=0.2, win_s=4.0)
+        clf = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), win_s=4.0)
         eeg_available = True #if the file exists, if the reader can read it
     except Exception as e:
         print("EEG feeder disabled:", e)
@@ -205,7 +188,7 @@ def main():
     while window.running:
         outer_steps += 1
         # ---- EEG update + choose params / color based on state ----
-        state = "NOT STRESSED"
+        state = "CALM"
         ratio = float('nan')
         now = time.perf_counter()
         dt_wall = now - last_time
@@ -222,16 +205,19 @@ def main():
         state, ratio, changed = clf.update(feeder.get_buffer())
         now = time.perf_counter()
         t = now - t0
-        if state == "STRESSED":
-            #f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.025, 0.058, 1.050, 0.50
-            base_f, base_k, base_Da, base_Db = 0.025, 0.058, 1.050, 0.50
-            stress_state[None] = 1
-            #stress_target = 1.0
-        else:
-            #f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.069, 0.063, 0.80, 0.50
-            base_f, base_k, base_Da, base_Db = 0.069, 0.063, 1.00, 0.50
+        if state == "CALM":
+            base_f, base_k, base_Da, base_Db = 0.053, 0.060, 0.755, 0.50
             stress_state[None] = 0
-            #stress_target = 0.0
+        elif state == "MOD-STRESS":
+            base_f, base_k, base_Da, base_Db = 0.045, 0.063, 0.755, 0.50
+            stress_state[None] = 1
+        elif state == "HIGH-STRESS":
+            base_f, base_k, base_Da, base_Db = 0.056, 0.107, 1.90, 0.28
+            stress_state[None] = 2
+        else: #"EXTREME-STRESS"
+            base_f, base_k, base_Da, base_Db = 0.025, 0.058, 1.050, 0.50
+            stress_state[None] = 3
+        
 
             # only wobble when we're close to the calm target already
             close = (abs(f[None] - base_f)  < 0.002 and
@@ -254,20 +240,11 @@ def main():
 
         # set TARGETS (let your existing easing move actual fields)
         f_target[None], k_target[None], Da_target[None], Db_target[None] = base_f, base_k, base_Da, base_Db
-        '''
-        if state == "STRESSED":
-            stress_state[None] = 1
-            f[None], k[None], Da[None], Db[None] = 0.025, 0.058, 1.050, 0.50 #NB chnage has to be GRADUAL!!! otherwise unstable
-        else:
-            stress_state[None] = 0
-            f[None], k[None], Da[None], Db[None] = 0.069, 0.063, 0.80, 0.50
-        '''
 
         # ---- GUI ----
         
         gui.text(f"File {current_track+1 if eeg_available else 0}")
-        #if eeg_available:
-        gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}  (thr_on={clf.thr_on:.2f}, thr_off={clf.thr_off:.2f})")
+        gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}" )
 
         if not on_program:
             # Sliders

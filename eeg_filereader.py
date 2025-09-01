@@ -89,30 +89,95 @@ def bandpower(psd, freqs, fmin, fmax):
     return float(np.trapz(psd[idx], freqs[idx]))
 
 class LiveArousalClassifier:
-    def __init__(self, fs=256.0, lf=(4.0,12.0), hf=(13.0,40.0),
-                 thr=3.0, hyst=0.2, win_s=4.0):
-        self.fs=fs; self.lf=lf; self.hf=hf
-        self.thr_on = float(thr)
-        self.thr_off = float(thr)*(1.0-float(hyst))
+    def __init__(self, 
+                 fs=256.0, 
+                 lf=(4.0,12.0), 
+                 hf=(13.0,40.0),
+                 # thresholds between categories (length 3: CALM|MOD|HIGH|EXT)
+                 boundaries=(3.0, 5.0, 9.0),
+                 hysteresis_frac=0.20,
+                 win_s=4.0):
+        self.fs = fs; 
+        self.lf = lf; 
+        self.hf = hf
+        self.boundaries = tuple(float(b) for b in boundaries)
+        self.hyst = float(hysteresis_frac)
+        self.thr_on = self.boundaries
+        self.thr_off = tuple(b * (1.0 - self.hyst) for b in self.boundaries)
         self.win_s = float(win_s)
-        self.state="NOT STRESSED"
-        self.last_ratio=np.nan
+        self.state = "CALM" # calm
+        self.last_ratio = np.nan
+
+
+    def _apply_hysteresis_step(self, ratio: float) -> bool:
+        """
+        Single-step hysteresis state machine.
+        Returns True if state changed, else False.
+        """
+        prev = self.state
+
+        if self.state == "CALM":
+            # CALM -> MODERATE if cross upward on-threshold[0]
+            if ratio >= self.thr_on[0]:
+                self.state = "MOD-STRESS"
+
+        elif self.state == "MOD-STRESS":
+            # MODERATE -> HIGH on-threshold[1]; back to CALM if below off-threshold[0]
+            if ratio >= self.thr_on[1]:
+                self.state = "HIGH-STRESS"
+            elif ratio < self.thr_off[0]:
+                self.state = "CALM"
+
+        elif self.state == 2:
+            # HIGH -> EXTREME on-threshold[2]; back to MODERATE if below off-threshold[1]
+            if ratio >= self.thr_on[2]:
+                self.state = "EXTREME-STRESS"
+            elif ratio < self.thr_off[1]:
+                self.state = "HIGH-STRESS"
+
+        else:  # self.level == 3 (EXTREME)
+            # EXTREME -> HIGH if drops below off-threshold[2]
+            if ratio < self.thr_off[2]:
+                self.state = "HIGH-STRESS"
+
+        return self.state != prev
     
     '''
     keep in mind:
     1) Ratios are unitless and scale-sensitive: If LF power is very small (close to 0), 
     the ratio can blow up because of division.
-    That’s why i add 1e-12 in your code — to avoid divide-by-zero.
+    That’s why i add 1e-12 in the code — to avoid divide-by-zero.
     '''
     def update(self, buffer):
+        '''
+        < 3 → "CALM / RELAXED"
+        3–5 → "MODERATE STRESS"
+        5–9 → "HIGH STRESS"
+        > 9 → "EXTREME STRESS"       
+        '''
         freqs, psd = compute_psd(buffer, self.fs, self.win_s)
         lf_p = bandpower(psd, freqs, *self.lf)
         hf_p = bandpower(psd, freqs, *self.hf)
         ratio = (hf_p + 1e-12)/(lf_p + 1e-12) # > 3 é stressato
+        
+        """
+        changed = True
+        safety = 0
+        while changed and safety < 4:
+            changed = self._apply_hysteresis_step(ratio)
+            safety += 1
+        """
+        
+        if ratio < 3:
+            self.state = "CALM" #RELAXED
+        elif ratio < 5.0:
+            self.state = "MOD-STRESS"
+        elif ratio < 8.0:
+            self.state = "HIGH-STRESS"
+        else:
+            self.state = "EXTREME-STRESS"
+        
         prev = self.state
-        if self.state=="NOT STRESSED" and ratio>=self.thr_on:
-            self.state="STRESSED"
-        elif self.state=="STRESSED" and ratio<=self.thr_off:
-            self.state="NOT STRESSED"
         self.last_ratio=ratio
+
         return self.state, ratio, (self.state!=prev)
