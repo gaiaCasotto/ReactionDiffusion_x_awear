@@ -1,13 +1,89 @@
 # rd_taichi_eeg_classify.py
 # Taichi Gray–Scott RD + live EEG HF/LF classifier to switch params and colors.
 
+
+'''
+adding watchdogs so that the patterns never die
+
+'''
+
 import time
 from sys import argv
 from collections import deque
 import numpy as np
 import taichi as ti
 
-from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
+# =========================
+# EEG streaming + classifier
+# =========================
+def load_eeg_file(path: str) -> np.ndarray:
+    with open(path, "r") as f:
+        txt = f.read().replace(",", " ")
+    arr = np.fromstring(txt, sep=" ")
+    arr = arr[np.isfinite(arr)].astype(np.float32)
+    if arr.size:
+        arr -= np.mean(arr)
+    return arr
+
+class OfflineEEGFeeder:
+    def __init__(self, paths, fs=256.0, chunk=32, speed=1.0, loop=True, buffer_s=8.0):
+        self.fs=float(fs); self.chunk=int(chunk); self.speed=float(speed)
+        self.loop=bool(loop); self.paths=list(paths)
+        self.tracks=[load_eeg_file(p) for p in paths]
+        if not self.tracks: raise ValueError("No EEG files loaded.")
+        self.i=0; self.idx=0; self.dt=self.chunk/(self.fs*self.speed)
+        self.buf=deque(maxlen=int(buffer_s*self.fs))
+    @property
+    def n_tracks(self): return len(self.tracks)
+    def set_track(self, i): self.i=int(i)%len(self.tracks); self.idx=0; self.buf.clear()
+    def step_once(self):
+        x=self.tracks[self.i]
+        if self.idx>=len(x):
+            if self.loop: self.idx=0
+            else: return False
+        j=min(self.idx+self.chunk, len(x))
+        self.buf.extend(x[self.idx:j].tolist()); self.idx=j; return True
+    def get_buffer(self):
+        return np.array(self.buf, dtype=np.float32) if self.buf else np.array([], np.float32)
+    def sleep_dt(self): time.sleep(self.dt)
+
+def compute_psd(buffer: np.ndarray, fs: float, win_s: float):
+    if buffer.size==0: return np.array([0.0]), np.array([0.0])
+    N=int(win_s*fs); x=buffer[-N:] if buffer.size>=N else buffer
+    if x.size < max(16, int(0.25*N)):
+        freqs=np.fft.rfftfreq(max(x.size,2), 1.0/fs)
+        return freqs, np.zeros_like(freqs, np.float32)
+    w=np.hanning(len(x)); X=np.fft.rfft(x*w)
+    psd=(np.abs(X)**2)/(fs*np.sum(w**2))
+    freqs=np.fft.rfftfreq(len(x), 1.0/fs)
+    return freqs, psd.astype(np.float32)
+
+def bandpower(psd, freqs, fmin, fmax):
+    idx=(freqs>=fmin)&(freqs<fmax)
+    if not np.any(idx): return 0.0
+    return float(np.trapz(psd[idx], freqs[idx]))
+
+class LiveArousalClassifier:
+    def __init__(self, fs=256.0, lf=(4.0,12.0), hf=(13.0,40.0),
+                 thr=3.0, hyst=0.2, win_s=4.0):
+        self.fs=fs; self.lf=lf; self.hf=hf
+        self.thr_on = float(thr)
+        self.thr_off = float(thr)*(1.0-float(hyst))
+        self.win_s = float(win_s)
+        self.state="NOT STRESSED"
+        self.last_ratio=np.nan
+    def update(self, buffer):
+        freqs, psd = compute_psd(buffer, self.fs, self.win_s)
+        lf_p = bandpower(psd, freqs, *self.lf)
+        hf_p = bandpower(psd, freqs, *self.hf)
+        ratio = (hf_p + 1e-12)/(lf_p + 1e-12) # > 3 é stressato
+        prev = self.state
+        if self.state=="NOT STRESSED" and ratio>=self.thr_on:
+            self.state="STRESSED"
+        elif self.state=="STRESSED" and ratio<=self.thr_off:
+            self.state="NOT STRESSED"
+        self.last_ratio=ratio
+        return self.state, ratio, (self.state!=prev)
 
 # =========================
 # Taichi Reaction–Diffusion
@@ -22,20 +98,6 @@ programs = [["Unstable mitosis and cell death", 0.057, 0.013,  1.57,  0.509],
     ["Colonies", 0.07, 0.011, 1.98, 0.231],
     ["Seekers", 0.064, 0.060, 1.691, 0.855],
     ["Colonisers", 0.064, 0.060, 1.691, 0.833]]
-
-# --- put near your other Python globals ---
-import time, numpy as np
-t0 = time.perf_counter()
-
-# tiny wobble amplitudes (tune to taste)
-AMP_F, AMP_K  = 0.0010, 0.001
-AMP_DA, AMP_DB = 0.015, 0.010
-# slow frequencies in Hz (different so they don’t sync)
-FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
-
-# helper to clamp
-def clamp(x, lo, hi): return max(lo, min(hi, x))
-
 
 @ti.func
 def smoothstep(x, edge0, edge1):
@@ -83,6 +145,53 @@ dB = ti.field(dtype=float, shape=(n, n))
 shading = ti.field(dtype=float, shape=(n, n))
 #render_image = ti.Vector.field(3, dtype=ti.f32, shape=(n, n))
 stress_state = ti.field(dtype=ti.i32, shape=())  # 1=STRESSED, 0=NOT
+
+
+##NEW##
+# --- Watchdog stats ---
+b_min   = ti.field(dtype=float, shape=())
+b_max   = ti.field(dtype=float, shape=())
+sumB    = ti.field(dtype=float, shape=())
+sumsqB  = ti.field(dtype=float, shape=())
+gradSum = ti.field(dtype=float, shape=())   # mean |∇B| proxy
+
+
+@ti.kernel
+def reset_stats():
+    b_min[None] = 1e9
+    b_max[None] = -1e9
+    sumB[None] = 0.0
+    sumsqB[None] = 0.0
+    gradSum[None] = 0.0
+
+@ti.func
+def safe(idx, nmax):
+    return max(0, min(nmax-1, idx))
+
+@ti.kernel
+def accumulate_stats():
+    for i, j in pixelsB:
+        v = pixelsB[i, j]
+        ti.atomic_min(b_min[None], v)
+        ti.atomic_max(b_max[None], v)
+        ti.atomic_add(sumB[None], v)
+        ti.atomic_add(sumsqB[None], v * v)
+
+        # gradient magnitude (4-neighborhood)
+        gx = pixelsB[safe(i+1, n), j] - pixelsB[safe(i-1, n), j]
+        gy = pixelsB[i, safe(j+1, n)] - pixelsB[i, safe(j-1, n)]
+        g = ti.abs(gx) + ti.abs(gy)
+        ti.atomic_add(gradSum[None], g)
+
+@ti.kernel
+def reseed_noise(amplitude: float, probability: float):
+    """Inject sparse noise so patterns revive but don’t explode."""
+    for i, j in pixelsB:
+        # Bernoulli-ish sparse mask
+        if ti.random(float) < probability:
+            pixelsB[i, j] += (ti.random(float) - 0.5) * amplitude
+
+
 
 @ti.func
 def laplacian(i,j, pixels):
@@ -168,11 +277,10 @@ def main():
     # ---------- EEG setup ----------
     EEG_FILES = [
         #"../eeg_files/1_horror_movie_data_filtered.txt",
-        "../eeg_files/2_vipassana_data_filtered.txt",
+        #"../eeg_files/2_vipassana_data_filtered.txt",
         #"../eeg_files/3_hot_tub_data_filtered.txt",
         #"../eeg_files/fake_eeg_stress2calm.txt"
-        #"../eeg_files/fake_eeg_longblocks.txt" #stressed first
-        #"../eeg_files/fake_eeg_longblocks_calmfirst.txt"
+        "../eeg_files/fake_eeg_longblocks.txt"
     ]
     EEG_FS = 256.0
     try:
@@ -193,13 +301,20 @@ def main():
     initialize()
 
     # Live control flags
+    eeg_mode = True  # toggle with 'E'
     current_track = 0
     outer_steps = 0
     last_time = time.perf_counter()
     f_target[None], k_target[None], Da_target[None], Db_target[None] = f[None], k[None], Da[None], Db[None]
 
-    base_f, base_k, base_Da, base_Db = 0.052, 0.055, 0.14, 0.07
-    
+
+    dead_frames = 0
+    PATIENCE = 30          # number of frames that must look "dead" before reseeding
+    RANGE_THR = 0.02       # if (max-min) below this, it's too flat
+    STD_THR   = 1e-3       # low variance means uniform field
+    GRAD_THR  = 1e-3       # weak edges/texture
+
+
 
     while window.running:
         outer_steps += 1
@@ -219,40 +334,15 @@ def main():
         
         feeder.step_once()
         state, ratio, changed = clf.update(feeder.get_buffer())
-        now = time.perf_counter()
-        t = now - t0
+
         if state == "STRESSED":
-            #f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.025, 0.058, 1.050, 0.50
-            base_f, base_k, base_Da, base_Db = 0.025, 0.058, 1.050, 0.50
+            f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.025, 0.058, 1.050, 0.50
             stress_state[None] = 1
             #stress_target = 1.0
         else:
-            #f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.069, 0.063, 0.80, 0.50
-            base_f, base_k, base_Da, base_Db = 0.069, 0.063, 1.00, 0.50
+            f_target[None], k_target[None], Da_target[None], Db_target[None] = 0.069, 0.063, 0.80, 0.50
             stress_state[None] = 0
             #stress_target = 0.0
-
-            # only wobble when we're close to the calm target already
-            close = (abs(f[None] - base_f)  < 0.002 and
-                    abs(k[None] - base_k)  < 0.002 and
-                    abs(Da[None]- base_Da) < 0.02  and
-                    abs(Db[None]- base_Db) < 0.02)
-
-            if close:
-                # slow, tiny LFOs
-                base_f  += AMP_F  * np.sin(2*np.pi*FREQ_F  * t)
-                base_k  += AMP_K  * np.sin(2*np.pi*FREQ_K  * t + 1.3)
-                base_Da += AMP_DA * np.sin(2*np.pi*FREQ_DA * t + 2.1)
-                base_Db += AMP_DB * np.sin(2*np.pi*FREQ_DB * t + 0.4)
-        
-        # clamp to safe ranges you already expose on sliders
-        base_f  = clamp(base_f,  0.002, 0.120)
-        base_k  = clamp(base_k,  0.014, 0.070)
-        base_Da = clamp(base_Da, 0.100, 2.000)
-        base_Db = clamp(base_Db, 0.100, 2.000)
-
-        # set TARGETS (let your existing easing move actual fields)
-        f_target[None], k_target[None], Da_target[None], Db_target[None] = base_f, base_k, base_Da, base_Db
         '''
         if state == "STRESSED":
             stress_state[None] = 1
@@ -285,13 +375,36 @@ def main():
         for _ in range(steps[None]):
             simulate()
 
+            # ---- evaluate reseed ----
+        reset_stats()
+        accumulate_stats()
+
+        # bring scalars to Python
+        bmin = b_min[None]
+        bmax = b_max[None]
+        rng  = bmax - bmin
+
+        NN   = float(n * n)
+        mean = sumB[None] / NN
+        var  = max(0.0, sumsqB[None] / NN - mean * mean)
+        std  = var ** 0.5
+        gmean = gradSum[None] / NN
+
+        # decide if "about to die"
+        is_flat = (rng < RANGE_THR) or (std < STD_THR) or (gmean < GRAD_THR)
+        dead_frames = dead_frames + 1 if is_flat else max(0, dead_frames - 1)
+
+        if dead_frames >= PATIENCE:
+            # gentle reseed: very sparse, very small noise
+            reseed_noise(amplitude=0.02, probability=0.002)
+            dead_frames = 0     # reset the counter
+
         # ---- render ----
         render_with_shader_kernel(pixelsB)
         canvas.set_image(render_image)
         window.show()
 
-        #if eeg_available:
-         #   feeder.sleep_dt()
+       
 
 if __name__ == "__main__":
     main()

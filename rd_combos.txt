@@ -6,6 +6,16 @@ raise Da --> makes snakes faster and more squiggly
 lower Da --> makes snakes slower and thinner thinner until they disappear
 
 
+"VERY CALM purple filled circle"
+k = 0.060
+f = 0.053
+Da -> 0.755
+Db -> 0.500
+(if f < 0.045) --> makes the purple vibrate and carves lines into the surface
+
+
+
+
 STRESSED
 "vibrating dots"
 k = 0.058
