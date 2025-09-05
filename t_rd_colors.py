@@ -1,7 +1,14 @@
 # rd_taichi_eeg_classify.py
 # Taichi Gray–Scott RD + live EEG HF/LF classifier to switch params and colors.
 
+"""
+ADDING SMOOTH INTERPOLATION OF COLORS BETWEEN STRESS LEVELS
+
+"""
+
+
 import time
+import random
 from sys import argv
 from collections import deque
 import numpy as np
@@ -41,8 +48,10 @@ Da_target = ti.field(dtype=float, shape=())
 Db_target = ti.field(dtype=float, shape=())
 
 # Smoothed stress mix (0..1) for visuals: 0 = NOT STRESSED, 1 = STRESSED
-stress_mix = ti.field(dtype=float, shape=())  # replaces hard 0/1 flips if you like
+stress_mix = ti.field(dtype=float, shape=()) 
 stress_mix[None] = 0.0
+stress_target= ti.field(dtype=ti.f32, shape=())
+
 
 # Operating parameters
 n = 800
@@ -98,6 +107,22 @@ def initialize():
         i, j = (_i-10, _j-10)
         pixelsB[n//2+i, n//2+j] = ti.exp(-0.1*(i**2+j**2))
 
+
+@ti.kernel
+def initialize_rnd(x: int, y: int):
+    for i, j in ti.ndrange(n,n):
+        pixelsA[i, j] = 0.0
+        pixelsB[i, j] = 0.0
+    for _i, _j in ti.ndrange(n-2, n-2):  # Iterate over the first two dimensions
+        i, j = (_i+1, _j+1) # Offset by 1 to avoid boundary issues
+        pixelsA[i, j] = 1.0
+
+    for _i, _j in ti.ndrange(20, 20):
+        i, j = (_i-10, _j-10)
+        if 0 <= x + i < n and 0 <= y + j < n:
+            pixelsB[x+i, y+j] = ti.exp(-0.1*(i**2+j**2))
+
+
 @ti.kernel
 def simulate():
     for _i, _j in ti.ndrange(n-2, n-2):
@@ -117,6 +142,14 @@ def simulate():
 
 render_image = ti.Vector.field(3, dtype=ti.f32, shape=(n, n))
 
+@ti.func
+def lerp(a: ti.f32, b: ti.f32, t: ti.f32) -> ti.f32:
+    return a + t * (b - a)
+
+@ti.func
+def lerp3(a: ti.types.vector(3, ti.f32), b: ti.types.vector(3, ti.f32), t: ti.f32):
+    return a + t * (b - a)
+
 
 @ti.kernel
 def render_with_shader_kernel(field: ti.template()):
@@ -128,47 +161,38 @@ def render_with_shader_kernel(field: ti.template()):
         light_dir  = ti.Vector([0.5, 1.0, 12.0]).normalized()
         illum      = max(0, light_dir.dot(norm))
         spec_illum = smoothstep(illum, 0.99, 0.999)
-        white = ti.Vector([1.0, 1.0, 1.0])
         
-        #---- hot red color map -----
-        # --- Magma palette ---
-        # low t  -> almost black with a faint red glow
-        # high t -> bright yellow/orange
-        '''
-        red = ti.Vector([1.00, 0.05, 0.00])         # vivid lava red (tiny green to avoid dulling)
-        th = ti.pow(t, 0.7)                          # nonlinear ramp to accent ridges
-        t0 = 0.25                                    # threshold: below this stays black
-        th = ti.max(0.0, (th - t0) / (1.0 - t0))     # remap so [t0..1] -> [0..1]
-
-        col = th * red                               # black → red
-
-        spec_color = ti.Vector([1.00, 0.50, 0.20])   # electric yellow specular
-        render_image[i, j] = illum * col + spec_illum * spec_color * 0.8
-        '''
-        '''
-        "STRESS COLOR???"
+        s = stress_mix[None] # 0..1, eased over time
+        
+        "==========  STRESS PALETTE========"
         deep_red   = ti.Vector([0.35, 0.00, 0.05])   # nearly black-red background
         hot_orange = ti.Vector([1.00, 0.35, 0.00])   # orange
         bright_yel = ti.Vector([1.00, 0.85, 0.20])   # yellow highlight
 
         # use a two-step blend: red → orange → yellow
         th  = ti.pow(t, 0.6)
-        col = (1.0 - th) * deep_red + th * hot_orange
-        col = (1.0 - th) * col + th * bright_yel  # pull the top end toward yellow
+        col_ext = (1.0 - th) * deep_red + th * hot_orange
+        col_ext = (1.0 - th) * col_ext + th * bright_yel 
+        spec_ext = ti.Vector([1.0, 0.8, 0.3])
+        render_image[i, j] = deep_red + illum * col_ext + spec_illum * spec_ext * 0.3
+        amb_ext  = deep_red * 0.10  # faint warm ambient
 
-        # warm specular highlight
-        spec_color = ti.Vector([1.0, 0.8, 0.3])
-        render_image[i, j] = deep_red + illum * col + spec_illum * spec_color * 0.3
-        '''
+        "============ CALM PALETTE ==============="
+        col_calm = ti.Vector([t, t , 0.8 - t])
+        spec_calm = ti.Vector([1.0, 1.0, 1.0]) #white
+        amb_calm  = ti.Vector([0.0, 0.0, 0.0])   # no ambient tint
 
-        "CALM"
-        #col = ti.Vector([t, t , 0.8 - t])
+        "============ SMOOTH from clam to stress by s ========== "
+        col        = lerp3(col_calm,  col_ext,  s)
+        spec_color = lerp3(spec_calm, spec_ext, s)
+        ambient    = lerp3(amb_calm,  amb_ext,  s)
+
+        "============ render ================="
+        render_image[i, j] = ambient + illum * col + spec_illum * spec_color * lerp(0.5, 0.3, s)
+        #render_image[i, j] = illum*col + spec_illum*white*0.5
         
-        "DEFAULT"
-        col = ti.Vector([0.4-t, 0.4-t, t])
-        render_image[i, j] = illum*col + spec_illum*white*0.5
 
-        
+
 #easing kernel. exponential approach with time-constant tau
 @ti.kernel
 def ease_params(alpha: float):
@@ -178,9 +202,10 @@ def ease_params(alpha: float):
     Da[None] += alpha * (Da_target[None] - Da[None])
     Db[None] += alpha * (Db_target[None] - Db[None])
 
+"""for smooth color transitions"""
 @ti.kernel
-def ease_stress(alpha: float, target: float):
-    stress_mix[None] += alpha * (target - stress_mix[None])
+def ease_stress(alpha: float):
+    stress_mix[None] = (1.0 - alpha) * stress_mix[None] + alpha * stress_target[None]
     
 t0 = time.perf_counter()
 
@@ -209,7 +234,10 @@ def main():
 
     # Program init from CLI choice (optional)
     on_program = False
-    initialize()
+    #initialize()
+    rx = random.randrange(n)
+    ry = random.randrange(n)
+    initialize_rnd(rx, ry)
 
     # Live control flags
     current_track = 0
@@ -217,7 +245,7 @@ def main():
     last_time = time.perf_counter()
     f_target[None], k_target[None], Da_target[None], Db_target[None] = f[None], k[None], Da[None], Db[None]
 
-    base_f, base_k, base_Da, base_Db = 0.052, 0.055, 0.14, 0.07
+    base_f, base_k, base_Da, base_Db = 0.04, 0.056, 1.05, 1.050
     
 
     while window.running:
@@ -234,25 +262,28 @@ def main():
 
         # apply easing
         ease_params(alpha)
-        #ease_stress(alpha, stress_target)
+        ease_stress(alpha) #for color transition
         
         feeder.step_once()
         state, ratio, changed = clf.update(feeder.get_buffer())
         now = time.perf_counter()
         t = now - t0
         if state == "CALM":
-            base_f, base_k, base_Da, base_Db = 0.053, 0.060, 0.755, 0.50
-            stress_state[None] = 0
+            base_f, base_k, base_Da, base_Db = 0.107, 0.056, 1.50, 0.591
+            stress_state[None]  = 0
+            stress_target[None] = 0
         elif state == "MOD-STRESS":
-            base_f, base_k, base_Da, base_Db = 0.045, 0.063, 0.755, 0.50
-            stress_state[None] = 1
+            base_f, base_k, base_Da, base_Db =  0.107, 0.056, 1.50, 0.591
+            stress_state[None]  = 1
+            stress_target[None] = 0.33
         elif state == "HIGH-STRESS":
-            base_f, base_k, base_Da, base_Db = 0.056, 0.107, 1.90, 0.28
-            stress_state[None] = 2
+            base_f, base_k, base_Da, base_Db = 0.024, 0.058, 1.050, 0.28
+            stress_state[None]  = 2
+            stress_target[None] = 0.66
         else: #"EXTREME-STRESS"
             base_f, base_k, base_Da, base_Db = 0.025, 0.058, 1.050, 0.50
-            stress_state[None] = 3
-        
+            stress_state[None]  = 3
+            stress_target[None] = 1        
 
             # only wobble when we're close to the calm target already
             close = (abs(f[None] - base_f)  < 0.002 and
@@ -291,7 +322,10 @@ def main():
             steps[None]=gui.slider_int("Steps", steps[None], 1, 300)
             
             if gui.button("Reset"):
-                initialize()
+                #initialize()
+                rx = random.randrange(n)
+                ry = random.randrange(n)
+                initialize_rnd(rx, ry)
             gui.end()
 
         # ---- simulate ----
