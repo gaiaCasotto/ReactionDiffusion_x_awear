@@ -2,9 +2,12 @@
 # Taichi Gray–Scott RD + live EEG HF/LF classifier to switch params and colors.
 
 """
-ADDING SMOOTH INTERPOLATION OF COLORS BETWEEN STRESS LEVELS
-
+ADDING MULTI USER FEATURES
 """
+
+import argparse
+import os
+import sys
 
 
 import time
@@ -83,6 +86,19 @@ FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
 
 
 def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Run RD visual driven by EEG text file(s). "
+                    "Provide one or more files; they will loop if --loop is set."
+    )
+    p.add_argument("file", nargs="+", help="EEG text file(s) to read (txt).")
+    p.add_argument("--fs", type=float, default=256.0, help="Sampling rate of the EEG files.")
+    p.add_argument("--chunk", type=int, default=32, help="Samples per feeder step.")
+    p.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier.")
+    p.add_argument("--loop", action="store_true", help="Loop files when reaching EOF.")
+    p.add_argument("--buffer", type=float, default=8.0, help="Seconds of rolling buffer.")
+    return p.parse_args()
 
 
 @ti.func
@@ -209,32 +225,47 @@ def ease_stress(alpha: float):
     
 t0 = time.perf_counter()
 
+
 def main():
+    args = parse_args()
+
     # ---------- EEG setup ----------
-    EEG_FILES = [
-        #"../eeg_files/1_horror_movie_data_filtered.txt",
-        #"../eeg_files/2_vipassana_data_filtered.txt",
-        #"../eeg_files/3_hot_tub_data_filtered.txt",
-        #"../eeg_files/fake_eeg_longblocks.txt" #stressed first
-        "../eeg_files/fake_eeg_longblocks_calmfirst.txt"
-    ]
-    EEG_FS = 256.0
+    EEG_FILES = args.file  # <- from command line
+    EEG_FS = args.fs
+
+    # Validate files
+    missing = [f for f in EEG_FILES if not os.path.isfile(f)]
+    if missing:
+        print("The following file(s) were not found:", *missing, sep="\n  - ")
+        sys.exit(1)
+
     try:
-        feeder = OfflineEEGFeeder(EEG_FILES, fs=EEG_FS, chunk=32, speed=1.0, loop=True, buffer_s=8.0)
+        feeder = OfflineEEGFeeder(
+            EEG_FILES,
+            fs=EEG_FS,
+            chunk=args.chunk,
+            speed=args.speed,
+            loop=args.loop,
+            buffer_s=args.buffer
+        )
         clf = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), win_s=4.0)
-        eeg_available = True #if the file exists, if the reader can read it
+        eeg_available = True
     except Exception as e:
         print("EEG feeder disabled:", e)
         eeg_available = False
         feeder = None; clf = None
-    
-    window = ti.ui.Window("Reaction Diffusion (EEG-driven colors & params)", (n, n))
+
+    # Window title: show first file if single
+    title = "Reaction Diffusion (EEG-driven colors & params)"
+    if len(EEG_FILES) == 1:
+        title += f" — {os.path.basename(EEG_FILES[0])}"
+
+    window = ti.ui.Window(title, (n, n))
     canvas = window.get_canvas()
     gui = window.get_gui()
 
     # Program init from CLI choice (optional)
     on_program = False
-    #initialize()
     rx = random.randrange(n)
     ry = random.randrange(n)
     initialize_rnd(rx, ry)
@@ -246,83 +277,76 @@ def main():
     f_target[None], k_target[None], Da_target[None], Db_target[None] = f[None], k[None], Da[None], Db[None]
 
     base_f, base_k, base_Da, base_Db = 0.04, 0.056, 1.05, 1.050
-    
 
     while window.running:
         outer_steps += 1
-        # ---- EEG update + choose params / color based on state ----
         state = "CALM"
         ratio = float('nan')
         now   = time.perf_counter()
         dt_wall   = now - last_time
         last_time = now
 
-        # Convert tau to a per-frame alpha: alpha = 1 - exp(-dt/tau)
+        # Convert tau to per-frame smoothing
         alpha = 1.0 - np.exp(-dt_wall / TAU_SECS)
 
         # apply easing
         ease_params(alpha)
-        ease_stress(alpha) #for color transition
-        
-        feeder.step_once()
-        state, ratio, changed = clf.update(feeder.get_buffer())
+        ease_stress(alpha)
+
+        if eeg_available:
+            feeder.step_once()
+            state, ratio, changed = clf.update(feeder.get_buffer())
+
         now = time.perf_counter()
         t = now - t0
+
         if state == "CALM":
             base_f, base_k, base_Da, base_Db = 0.107, 0.056, 1.50, 0.591
             stress_state[None]  = 0
             stress_target[None] = 0
         elif state == "MOD-STRESS":
-            base_f, base_k, base_Da, base_Db =  0.107, 0.056, 1.50, 0.591
+            base_f, base_k, base_Da, base_Db = 0.107, 0.056, 1.50, 0.591
             stress_state[None]  = 1
             stress_target[None] = 0.33
         elif state == "HIGH-STRESS":
             base_f, base_k, base_Da, base_Db = 0.024, 0.058, 1.050, 0.28
             stress_state[None]  = 2
             stress_target[None] = 0.66
-        else: #"EXTREME-STRESS"
+        else:  # "EXTREME-STRESS"
             base_f, base_k, base_Da, base_Db = 0.025, 0.058, 1.050, 0.50
             stress_state[None]  = 3
-            stress_target[None] = 1        
+            stress_target[None] = 1
 
-            # only wobble when we're close to the calm target already
             close = (abs(f[None] - base_f)  < 0.002 and
-                    abs(k[None] - base_k)  < 0.002 and
-                    abs(Da[None]- base_Da) < 0.02  and
-                    abs(Db[None]- base_Db) < 0.02)
-
+                     abs(k[None] - base_k)  < 0.002 and
+                     abs(Da[None]- base_Da) < 0.02  and
+                     abs(Db[None]- base_Db) < 0.02)
             if close:
-                # slow, tiny LFOs
                 base_f  += AMP_F  * np.sin(2*np.pi*FREQ_F  * t)
                 base_k  += AMP_K  * np.sin(2*np.pi*FREQ_K  * t + 1.3)
                 base_Da += AMP_DA * np.sin(2*np.pi*FREQ_DA * t + 2.1)
                 base_Db += AMP_DB * np.sin(2*np.pi*FREQ_DB * t + 0.4)
-        
-        # clamp to safe ranges you already expose on sliders
+
+        # clamp & set targets
         base_f  = clamp(base_f,  0.002, 0.120)
         base_k  = clamp(base_k,  0.014, 0.070)
         base_Da = clamp(base_Da, 0.100, 2.000)
         base_Db = clamp(base_Db, 0.100, 2.000)
-
-        # set TARGETS (let your existing easing move actual fields)
         f_target[None], k_target[None], Da_target[None], Db_target[None] = base_f, base_k, base_Da, base_Db
 
         # ---- GUI ----
-        
-        gui.text(f"File {current_track+1 if eeg_available else 0}")
-        gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}" )
+        if eeg_available:
+            gui.text(f"File(s): {', '.join([os.path.basename(f) for f in EEG_FILES])}")
+            gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}")
 
         if not on_program:
-            # Sliders
             gui.begin("Controls", 0, 0, 0.25, 0.18)
             k[None] = gui.slider_float("k",  k[None], 0.014, 0.07)
             f[None] = gui.slider_float("f",  f[None], 0.002, 0.12)
             Da[None]= gui.slider_float("Da", Da[None], 0.1,  2.0)
             Db[None]= gui.slider_float("Db", Db[None], 0.1,  2.0)
             steps[None]=gui.slider_int("Steps", steps[None], 1, 300)
-            
             if gui.button("Reset"):
-                #initialize()
                 rx = random.randrange(n)
                 ry = random.randrange(n)
                 initialize_rnd(rx, ry)
@@ -336,9 +360,6 @@ def main():
         render_with_shader_kernel(pixelsB)
         canvas.set_image(render_image)
         window.show()
-
-        #if eeg_available:
-         #   feeder.sleep_dt()
 
 if __name__ == "__main__":
     main()

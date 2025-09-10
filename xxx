@@ -1,0 +1,1 @@
+python 5_socket_launcher_v2.py ../eeg_files/1_horror_movie_data_filtered.txt ../eeg_files/2_vipassana_data_filtered.txt ../eeg_files/3_hot_tub_data_filtered.txt ../eeg_files/fake_eeg_longblocks_calmfirst.txt ../eeg_files/fake_eeg_longblocks.txt

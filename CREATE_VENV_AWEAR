@@ -1,0 +1,6 @@
+#!/bin/bash
+python -m venv venv_awear
+
+source venv_awear/bin/activate
+pip install --upgrade pip
+pip install taichi

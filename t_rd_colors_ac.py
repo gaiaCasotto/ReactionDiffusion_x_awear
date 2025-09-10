@@ -9,12 +9,21 @@ ADDING SMOOTH INTERPOLATION OF COLORS BETWEEN STRESS LEVELS
 
 import time
 import random
+import argparse
 from sys import argv
 from collections import deque
 import numpy as np
 import taichi as ti
 # (my own file - reads brainwave files and classifies stressed or not)
 from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
+
+parser = argparse.ArgumentParser( description="AWEAR DEMO 1" )
+parser.add_argument( "--port", type=int, default=5001, help="port for socket")
+parser.add_argument( "--file",                         help="Name of file to read. Could be a fifo" )
+parser.add_argument( "--title",  default="Awear demo",  help="Title for window" )
+parser.add_argument( "--width",  type=int, default=600, help="Width of visualization window" )
+parser.add_argument( "--height", type=int, default=400, help="Height of visualization window" )
+args = parser.parse_args()
 
 # =========================
 # Taichi Reaction–Diffusion
@@ -24,7 +33,8 @@ from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
 #==========================
 
 
-ti.init(arch=ti.gpu)
+# ti.init(arch=ti.gpu)
+ti.init(arch=ti.cpu,cpu_max_num_threads=3)
 
 # Params (fields so kernels see updates immediately)
 #Mitosis
@@ -48,21 +58,23 @@ Da_target = ti.field(dtype=float, shape=())
 Db_target = ti.field(dtype=float, shape=())
 
 # Smoothed stress mix (0..1) for visuals: 0 = NOT STRESSED, 1 = STRESSED
-stress_mix = ti.field(dtype=float, shape=()) 
+stress_mix       = ti.field(dtype=float, shape=()) 
 stress_mix[None] = 0.0
-stress_target= ti.field(dtype=ti.f32, shape=())
+stress_target    = ti.field(dtype=ti.f32, shape=())
 
 
 # Operating parameters
-n = 512#800
+n        = 800
+width    = 300                  # ac
+height   = 200                  # ac
 TAU_SECS = 3.0 
 
 # Fields
 pixelsA = ti.field(dtype=float, shape=(n, n))
 pixelsB = ti.field(dtype=float, shape=(n, n))
-dA = ti.field(dtype=float, shape=(n, n))
-dB = ti.field(dtype=float, shape=(n, n))
-shading = ti.field(dtype=float, shape=(n, n))
+dA      = ti.field(dtype=float, shape=(n, n))
+dB      = ti.field(dtype=float, shape=(n, n))
+shading      = ti.field(dtype=float, shape=(n, n))
 stress_state = ti.field(dtype=ti.i32, shape=()) 
 
 '''
@@ -76,8 +88,8 @@ stress_state = ti.field(dtype=ti.i32, shape=())
 '''
 
 # tiny wobble amplitudes
-AMP_F, AMP_K  = 0.0010, 0.001
-AMP_DA, AMP_DB = 0.015, 0.010
+AMP_F,  AMP_K  = 0.0010, 0.001
+AMP_DA, AMP_DB = 0.015,  0.010
 # slow frequencies in Hz (different so they don’t sync)
 FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
 
@@ -218,17 +230,18 @@ def main():
         #"../eeg_files/fake_eeg_longblocks.txt" #stressed first
         "../eeg_files/fake_eeg_longblocks_calmfirst.txt"
     ]
+    EEG_FILES = [ args.file ]
     EEG_FS = 256.0
     try:
         feeder = OfflineEEGFeeder(EEG_FILES, fs=EEG_FS, chunk=32, speed=1.0, loop=True, buffer_s=8.0)
-        clf = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), win_s=4.0)
+        clf    = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), win_s=4.0)
         eeg_available = True #if the file exists, if the reader can read it
     except Exception as e:
         print("EEG feeder disabled:", e)
         eeg_available = False
         feeder = None; clf = None
     
-    window = ti.ui.Window("Reaction Diffusion (EEG-driven colors & params)", (n, n))
+    window = ti.ui.Window( args.title , (n, n))
     canvas = window.get_canvas()
     gui = window.get_gui()
 

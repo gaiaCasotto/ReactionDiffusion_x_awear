@@ -50,6 +50,10 @@ def load_eeg_file(path: str) -> np.ndarray:
         arr -= np.mean(arr)
     return arr
 
+#need to leggere un stream e non un file. Quindi leggi finchè non finisce il data
+
+
+
 class OfflineEEGFeeder:
     def __init__(self, paths, fs=256.0, chunk=32, speed=1.0, loop=True, buffer_s=8.0):
         self.fs=float(fs); self.chunk=int(chunk); self.speed=float(speed)
@@ -87,6 +91,36 @@ def bandpower(psd, freqs, fmin, fmax):
     idx=(freqs>=fmin)&(freqs<fmax)
     if not np.any(idx): return 0.0
     return float(np.trapz(psd[idx], freqs[idx]))
+
+
+
+# ---------- NEW: simple streaming feeder ----------
+class LiveEEGStreamFeeder:
+    """
+    Thread-safe-ish ring buffer for live, single-channel EEG samples.
+    - push(samples): append a list/ndarray of floats
+    - get_buffer(): returns a numpy array of the most recent buffer_s seconds
+    """
+    def __init__(self, fs: float, buffer_s: float = 8.0):
+        self.fs = float(fs)
+        self.maxlen = int(self.fs * buffer_s)
+        self.buf = deque(maxlen=self.maxlen)
+
+    def push(self, samples):
+        if samples is None:
+            return
+        arr = np.asarray(samples, dtype=np.float32).ravel()
+        self.buf.extend(arr.tolist())
+
+    def get_buffer(self):
+        if not self.buf:
+            return np.zeros(self.maxlen, dtype=np.float32)
+        return np.asarray(self.buf, dtype=np.float32)
+
+    def step_once(self):
+        # kept for API compatibility with your original loop
+        pass
+
 
 class LiveArousalClassifier:
     def __init__(self, 
@@ -181,3 +215,4 @@ class LiveArousalClassifier:
         self.last_ratio=ratio
 
         return self.state, ratio, (self.state!=prev)
+    

@@ -6,7 +6,7 @@ ADDING SMOOTH INTERPOLATION OF COLORS BETWEEN STRESS LEVELS
 
 """
 
-
+import argparse
 import time
 import random
 from sys import argv
@@ -14,7 +14,7 @@ from collections import deque
 import numpy as np
 import taichi as ti
 # (my own file - reads brainwave files and classifies stressed or not)
-from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
+#from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
 
 # =========================
 # Taichi Reaction–Diffusion
@@ -22,6 +22,13 @@ from eeg_filereader import OfflineEEGFeeder, LiveArousalClassifier
 #==========================
 #   GLOBAL VARIABLES 
 #==========================
+
+# (your original classifier)
+from eeg_filereader import LiveArousalClassifier, LiveEEGStreamFeeder
+
+# ---------- NEW: Flask ingest server ----------
+from flask import Flask, request, jsonify
+from threading import Thread
 
 
 ti.init(arch=ti.gpu)
@@ -54,7 +61,7 @@ stress_target= ti.field(dtype=ti.f32, shape=())
 
 
 # Operating parameters
-n = 512#800
+n = 400#800
 TAU_SECS = 3.0 
 
 # Fields
@@ -80,6 +87,50 @@ AMP_F, AMP_K  = 0.0010, 0.001
 AMP_DA, AMP_DB = 0.015, 0.010
 # slow frequencies in Hz (different so they don’t sync)
 FREQ_F, FREQ_K, FREQ_DA, FREQ_DB = 0.03, 0.021, 0.017, 0.026
+
+
+
+'''===================== FLASK app ===================='''
+# ---------- NEW: Flask app factory ----------
+def make_app(feeder: LiveEEGStreamFeeder):
+    app = Flask(__name__)
+
+    @app.get("/")
+    def home():
+        return "Awear Test app"
+
+    @app.get("/health")
+    def health():
+        return jsonify(status="ok", buffered=len(feeder.buf), capacity=feeder.maxlen, fs=feeder.fs)
+
+    @app.post("/ingest")
+    def ingest():
+        """
+        Body: application/json
+        {
+          "samples": [0.001, -0.002, ...]  # batch of floats
+        }
+        """
+        try:
+            payload = request.get_json(force=True, silent=False)
+            if not payload or "samples" not in payload:
+                return jsonify(error="Missing 'samples' in JSON"), 400
+            samples = payload["samples"]
+            feeder.push(samples)
+            return jsonify(ok=True, received=len(np.asarray(samples).ravel()), buffered=len(feeder.buf))
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    return app
+
+def start_server(app, host: str, port: int):
+    th = Thread(target=lambda: app.run(host=host, port=port, threaded=True, use_reloader=False), daemon=True)
+    th.start()
+    return th
+
+# ------- end of Flask --------
+
+
 
 
 def clamp(x, lo, hi): return max(lo, min(hi, x))
@@ -121,6 +172,14 @@ def initialize_rnd(x: int, y: int):
         i, j = (_i-10, _j-10)
         if 0 <= x + i < n and 0 <= y + j < n:
             pixelsB[x+i, y+j] = ti.exp(-0.1*(i**2+j**2))
+
+# --- no RD, for when waiting for signal... ---- 
+@ti.kernel
+def clear_to_blue():
+    for i, j in render_image:
+        # gentle blue; tweak if you want
+        render_image[i, j] = ti.Vector([0.05, 0.10, 0.60])
+
 
 
 @ti.kernel
@@ -210,34 +269,75 @@ def ease_stress(alpha: float):
 t0 = time.perf_counter()
 
 def main():
+    '''
+    # ---------- OLD CLI ----------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eeg", action="append", help="Path to EEG .txt file (can repeat)", default=None)
+    parser.add_argument("--user", type=int, default=None, help="Optional user index passed by launcher")
+    args = parser.parse_args()
+
+    
     # ---------- EEG setup ----------
-    EEG_FILES = [
-        #"../eeg_files/1_horror_movie_data_filtered.txt",
-        #"../eeg_files/2_vipassana_data_filtered.txt",
-        #"../eeg_files/3_hot_tub_data_filtered.txt",
-        #"../eeg_files/fake_eeg_longblocks.txt" #stressed first
-        "../eeg_files/fake_eeg_longblocks_calmfirst.txt"
-    ]
+    if args.eeg:
+        EEG_FILES = args.eeg                     # from launcher (can be 1+ files)
+    else:
+        EEG_FILES = ["../eeg_files/fake_eeg_longblocks_calmfirst.txt"]  # fallback
+
     EEG_FS = 256.0
     try:
         feeder = OfflineEEGFeeder(EEG_FILES, fs=EEG_FS, chunk=32, speed=1.0, loop=True, buffer_s=8.0)
         clf = LiveArousalClassifier(fs=EEG_FS, lf=(4,12), hf=(13,40), win_s=4.0)
-        eeg_available = True #if the file exists, if the reader can read it
+        eeg_available = True
     except Exception as e:
         print("EEG feeder disabled:", e)
         eeg_available = False
         feeder = None; clf = None
-    
-    window = ti.ui.Window("Reaction Diffusion (EEG-driven colors & params)", (n, n))
+
+    window_title = "Reaction Diffusion (EEG-driven colors & params)"
+    if args.user is not None:
+        window_title += f" — user {args.user}"
+    window = ti.ui.Window(window_title, (n, n))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    '''
+
+    # ----------NEW CLI WITH FLASK-----------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fs", type=float, default=256.0, help="Incoming sample rate (Hz) for the live stream")
+    parser.add_argument("--buffer-s", type=float, default=8.0, help="Seconds of history to keep in memory")
+    parser.add_argument("--port", type=int, default=5000, help="Flask server port")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Flask bind host")
+    parser.add_argument("--user", type=int, default=None, help="Optional user index for window title")
+    parser.add_argument("--posx", type=int, default=100, help="x coord of window pop-up")
+    parser.add_argument("--posy", type=int, default=100, help="y coord of window pop-up")
+
+    args = parser.parse_args()
+
+    EEG_FS = float(args.fs)
+    WIN_S  = 4.0
+    feeder = LiveEEGStreamFeeder(fs=EEG_FS, buffer_s=args.buffer_s)
+    clf    = LiveArousalClassifier(fs=EEG_FS, lf=(4, 12), hf=(13, 40), win_s=WIN_S)
+
+    app = make_app(feeder)
+    _   = start_server(app, host=args.host, port=args.port)
+
+    window_title = "Awear RD — LIVE"
+    if args.user is not None:
+        window_title += f" — user {args.user}"
+    window = ti.ui.Window(window_title, (n, n), pos = (args.posx, args.posy))
+    window.show_fps = False
     canvas = window.get_canvas()
     gui = window.get_gui()
 
+
     # Program init from CLI choice (optional)
+    rd_seeded  = False
     on_program = False
-    #initialize()
     rx = random.randrange(n)
     ry = random.randrange(n)
-    initialize_rnd(rx, ry)
+    #initialize()
+    #initialize_rnd(rx, ry)
+    need_samples = int(max(1, EEG_FS * WIN_S)) #samples needed to start the RD
 
     # Live control flags
     current_track = 0
@@ -250,17 +350,35 @@ def main():
 
     while window.running:
         outer_steps += 1
-        # ---- EEG update + choose params / color based on state ----
+
+        # --- Check live buffer fill level ---
+        buffered = len(feeder.buf)  # LiveEEGStreamFeeder exposes .buf (deque)
+        has_enough = buffered >= need_samples
+
+        if not has_enough:
+            # Not enough data -> show blue background, no sim/easing
+            gui.text(f"Live stream on :{args.port}")
+            gui.text(f"Waiting for data… {buffered}/{need_samples} samples")
+            # Paint blue
+            clear_to_blue()
+            canvas.set_image(render_image)
+            window.show()
+            continue
+
+        if not rd_seeded: #------ this is the first time i have enough data in the buffer -----
+            initialize_rnd(rx, ry)
+            rd_seeded = True
+
+        
         state = "CALM"
         ratio = float('nan')
+
         now   = time.perf_counter()
         dt_wall   = now - last_time
         last_time = now
 
-        # Convert tau to a per-frame alpha: alpha = 1 - exp(-dt/tau)
+        # per-frame alpha: alpha = 1 - exp(-dt/tau)
         alpha = 1.0 - np.exp(-dt_wall / TAU_SECS)
-
-        # apply easing
         ease_params(alpha)
         ease_stress(alpha) #for color transition
         
@@ -268,6 +386,7 @@ def main():
         state, ratio, changed = clf.update(feeder.get_buffer())
         now = time.perf_counter()
         t = now - t0
+
         if state == "CALM":
             base_f, base_k, base_Da, base_Db = 0.107, 0.056, 1.50, 0.591
             stress_state[None]  = 0
@@ -307,10 +426,11 @@ def main():
         # set TARGETS (let your existing easing move actual fields)
         f_target[None], k_target[None], Da_target[None], Db_target[None] = base_f, base_k, base_Da, base_Db
 
+
         # ---- GUI ----
-        
-        gui.text(f"File {current_track+1 if eeg_available else 0}")
-        gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}" )
+        #gui.text(f"File {current_track+1 if eeg_available else 0}")
+        gui.text(f"Live stream on :{args.port}")
+        gui.text(f"HF/LF: {ratio:.3f}  |  State: {state}")
 
         if not on_program:
             # Sliders
@@ -337,8 +457,6 @@ def main():
         canvas.set_image(render_image)
         window.show()
 
-        #if eeg_available:
-         #   feeder.sleep_dt()
 
 if __name__ == "__main__":
     main()
